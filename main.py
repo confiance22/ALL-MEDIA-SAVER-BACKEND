@@ -1,4 +1,5 @@
 import asyncio
+import html as htmlmod
 import json
 import os
 import re
@@ -9,6 +10,7 @@ from urllib.parse import quote
 
 import httpx
 import yt_dlp
+from curl_cffi import requests as curl_requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +19,8 @@ from imageio_ffmpeg import get_ffmpeg_exe
 from pydantic import BaseModel
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -181,6 +185,100 @@ def _is_tiktok(url: str) -> bool:
     return "tiktok.com" in _host_of(url)
 
 
+def _try_tiktok_photo(url: str) -> ExtractResponse | None:
+    m = re.search(r"/(?:@[^/]+|t)/photo/(\d+)", url)
+    if not m:
+        return None
+    video_id = m.group(1)
+    user_match = re.search(r"@([^/]+)", url)
+    user = user_match.group(1) if user_match else "_"
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+    }
+    cookie = _load_cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        html = ""
+        for _attempt in range(3):
+            resp = curl_requests.get(
+                f"https://www.tiktok.com/embed/v2/{video_id}",
+                headers=headers,
+                impersonate="chrome",
+                timeout=25,
+            )
+            resp.raise_for_status()
+            html = resp.text
+            if "photomode-image" in html:
+                break
+    except Exception:
+        return None
+    photo_urls = [
+        htmlmod.unescape(u)
+        for u in re.findall(r'<img[^>]+src="([^"]+)"', html)
+        if "photomode-image" in u
+    ]
+    photo_urls = list(dict.fromkeys(photo_urls))
+    if not photo_urls:
+        return None
+    title = _try_tiktok_caption(user, video_id) or "tiktok-photo"
+    base = _safe_filename(title)
+    items = [
+        MediaItem(
+            url=image_url,
+            type="image",
+            filename=f"{base}_{i + 1:02d}.jpg",
+            thumbnail=photo_urls[0],
+        )
+        for i, image_url in enumerate(photo_urls)
+    ]
+    return ExtractResponse(
+        type="carousel" if len(items) > 1 else "image",
+        title=title,
+        items=items,
+    )
+
+
+def _try_tiktok_caption(user: str, video_id: str) -> str | None:
+    headers = {
+        "User-Agent": BROWSER_UA,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+    }
+    cookie = _load_cookie_header()
+    if cookie:
+        headers["Cookie"] = cookie
+    try:
+        resp = curl_requests.get(
+            f"https://www.tiktok.com/@{user}/video/{video_id}",
+            headers=headers,
+            impersonate="chrome",
+            timeout=25,
+        )
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        return None
+    data_match = re.search(
+        r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL,
+    )
+    if not data_match:
+        return None
+    try:
+        scope = json.loads(data_match.group(1)).get("__DEFAULT_SCOPE__") or {}
+    except Exception:
+        return None
+    desc = scope.get("webapp.video-detail", {})
+    desc = desc.get("itemInfo", {})
+    desc = desc.get("itemStruct", {})
+    desc = desc.get("desc")
+    return str(desc).strip() or None
+
+
 def _is_twitter(url: str) -> bool:
     host = _host_of(url)
     return "twitter.com" in host or "x.com" in host
@@ -277,6 +375,11 @@ def _try_twitter_og(url: str) -> ExtractResponse | None:
 
 
 def _extract_media(url: str) -> ExtractResponse:
+    if _is_tiktok(url) and "/photo/" in url:
+        photo = _try_tiktok_photo(url)
+        if photo:
+            return photo
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -285,7 +388,7 @@ def _extract_media(url: str) -> ExtractResponse:
     }
     if _want_youtube(url):
         opts["format"] = YT_FORMAT_SELECTOR
-    cookies_file = os.environ.get("COOKIES_FILE", "").strip()
+    cookies_file = _cookie_file()
     if cookies_file and os.path.exists(cookies_file):
         opts["cookiefile"] = cookies_file
     cookies_browser = os.environ.get("COOKIES_BROWSER", "").strip().lower()
@@ -322,12 +425,20 @@ def _extract_media(url: str) -> ExtractResponse:
                 ),
             )
         if _is_tiktok(url):
+            if "/photo/" in url:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "TikTok did not serve its photo gallery this time (they challenge "
+                        "automated requests). Wait a few seconds and try again."
+                    ),
+                )
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "TikTok blocked the request (they challenge servers without a logged-in session). "
-                    "Set the COOKIES_FILE or COOKIES_BROWSER environment variable on the backend "
-                    "(see README) and try again. Original error: " + str(exc)
+                    "Make sure backend/cookies.txt contains a fresh logged-in TikTok session, "
+                    "then redeploy. Original error: " + str(exc)
                 ),
             )
         raise HTTPException(status_code=400, detail=f"Could not resolve that link: {exc}")
@@ -451,8 +562,15 @@ async def _stream_merged(video_url: str, audio_url: str):
         stderr_task.cancel()
 
 
-def _load_cookie_header() -> str | None:
+def _cookie_file() -> str:
     path = os.environ.get("COOKIES_FILE", "cookies.txt").strip()
+    if not path:
+        return ""
+    return path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
+
+
+def _load_cookie_header() -> str | None:
+    path = _cookie_file()
     if not path or not os.path.exists(path):
         return None
     pairs = []

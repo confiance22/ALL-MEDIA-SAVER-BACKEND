@@ -1,15 +1,23 @@
-app = "media-saver-backend"
+# fly.toml app configuration file generated for media-saver-backend on 2026-09-24T14:52:39+02:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'media-saver-backend'
+primary_region = 'cdg'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  FRONTEND_ORIGIN = ""
+  FRONTEND_ORIGIN = ''
 
 [http_service]
   internal_port = 8080
   force_https = true
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+  cpus = 1
+  memory_mb = 256
