@@ -1,0 +1,15 @@
+app = "media-saver-backend"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  FRONTEND_ORIGIN = ""
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
