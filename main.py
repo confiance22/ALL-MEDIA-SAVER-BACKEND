@@ -260,23 +260,31 @@ def _try_tiktok_caption(user: str, video_id: str) -> str | None:
         resp.raise_for_status()
         html = resp.text
     except Exception:
-        return None
+        html = ""
     data_match = re.search(
         r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
         html,
         re.DOTALL,
     )
-    if not data_match:
-        return None
+    if data_match:
+        try:
+            scope = json.loads(data_match.group(1)).get("__DEFAULT_SCOPE__") or {}
+        except Exception:
+            scope = {}
+        desc = scope.get("webapp.video-detail", {}).get("itemInfo", {}).get("itemStruct", {}).get("desc")
+        if desc:
+            return str(desc).strip()
+    oembed_url = f"https://www.tiktok.com/oembed?url={quote(f'https://www.tiktok.com/@{user}/video/{video_id}')}"
     try:
-        scope = json.loads(data_match.group(1)).get("__DEFAULT_SCOPE__") or {}
+        resp = curl_requests.get(oembed_url, headers=headers, impersonate="chrome", timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+        title = (data.get("title") or "").strip()
+        if title:
+            return title
     except Exception:
-        return None
-    desc = scope.get("webapp.video-detail", {})
-    desc = desc.get("itemInfo", {})
-    desc = desc.get("itemStruct", {})
-    desc = desc.get("desc")
-    return str(desc).strip() or None
+        pass
+    return None
 
 
 def _is_twitter(url: str) -> bool:
