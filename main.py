@@ -382,6 +382,11 @@ def _try_twitter_og(url: str) -> ExtractResponse | None:
     return None
 
 
+def _is_youtube_bot_check(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "not a bot" in text or "sign in to confirm" in text
+
+
 def _extract_media(url: str) -> ExtractResponse:
     if _is_tiktok(url) and "/photo/" in url:
         photo = _try_tiktok_photo(url)
@@ -407,6 +412,16 @@ def _extract_media(url: str) -> ExtractResponse:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
+        if _want_youtube(url) and _is_youtube_bot_check(exc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "YouTube is requiring a signed-in session from this server. Sign in to "
+                    "youtube.com in your browser, export that site's cookies with the "
+                    "'Get cookies.txt LOCALLY' extension, and replace backend/cookies.txt, "
+                    "then redeploy the backend."
+                ),
+            )
         if _is_instagram(url):
             photo = _try_instagram_photo(url)
             if photo:
